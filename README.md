@@ -198,6 +198,7 @@ add.
 | No menu-bar icon after launching | Read `~/Library/Logs/my_immich.log`. Re-run `bash install.sh` if it mentions `rumps`. |
 | Setup says immich-go was not found | `brew install immich-go`, or set its full path under More options. |
 | "Cannot reach …" on Test connection | You are off the home network/VPN, or the address or port is wrong. |
+| "… answered HTTP 403 Forbidden" on Test connection | The address is right, but something in front of Immich (Cloudflare, an access gateway, a reverse-proxy rule) refused the request. Allow this Mac or the `my_immich` user agent there, or use the local address. |
 | "API key was refused" | The key is wrong or lacks `user.read`; see the list above. |
 | Card not listed | It must be mounted and contain a `DCIM` folder. Press "Look for cards and drives again", or use Choose folder. |
 | A folder shows "macOS did not allow reading this folder" | System Settings → Privacy & Security → Files and Folders: allow Python (my_immich) for that location. |

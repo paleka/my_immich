@@ -16,7 +16,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 TMP = tempfile.mkdtemp(prefix="my_immich_test_")
@@ -269,6 +269,77 @@ class JobTests(unittest.TestCase):
         self.assertIn("API key", error)
         _, error = self.run_job(cfg(immich_go_path="/nope/immich-go"), str(CARD / "DCIM"))
         self.assertIn("immich-go was not found", error)
+
+
+class FakeImmich(BaseHTTPRequestHandler):
+    """Stands in for Immich behind a proxy that, like Cloudflare, refuses
+    Python's default user agent before the request reaches the server."""
+    blocked = False  # when True, refuse everything, as an access gateway would
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        ua = self.headers.get("User-Agent", "")
+        if self.blocked or not ua or ua.startswith("Python-urllib"):
+            return self.reply(403, b"error code: 1010", "text/plain")
+        if self.path == "/api/server/ping":
+            return self.reply(200, b'{"res": "pong"}')
+        if self.path == "/api/users/me":
+            if self.headers.get("x-api-key") == "good-key":
+                return self.reply(200, b'{"name": "Demo User"}')
+            return self.reply(401, b'{"message": "Invalid API key"}')
+        self.reply(404, b"{}")
+
+    def reply(self, code, body, ctype="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ConnectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeImmich)
+        cls.base = "http://127.0.0.1:%d" % cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def tearDown(self):
+        FakeImmich.blocked = False
+
+    def test_connection_gets_past_a_proxy_that_blocks_python_urllib(self):
+        result = app.test_connection(cfg(server=self.base, api_key="good-key"))
+        self.assertTrue(result["ok"], result["message"])
+        self.assertIn("Demo User", result["message"])
+
+    def test_server_stats_send_the_user_agent_too(self):
+        self.assertIn("ping_ms", app.server_stats(cfg(server=self.base, api_key="good-key")))
+
+    def test_http_403_is_not_reported_as_a_network_problem(self):
+        FakeImmich.blocked = True
+        result = app.test_connection(cfg(server=self.base, api_key="good-key"))
+        self.assertFalse(result["ok"])
+        self.assertIn("HTTP 403", result["message"])
+        self.assertIn("error code: 1010", result["message"])
+        self.assertNotIn("same network", result["message"])
+
+    def test_refused_key_reports_immichs_message(self):
+        result = app.test_connection(cfg(server=self.base, api_key="bad-key"))
+        self.assertFalse(result["ok"])
+        self.assertIn("API key was refused (HTTP 401)", result["message"])
+        self.assertIn("Invalid API key", result["message"])
+        self.assertNotIn("bad-key", result["message"])
+
+    def test_unreachable_server_still_says_cannot_reach(self):
+        result = app.test_connection(cfg(server="http://127.0.0.1:1", api_key="good-key"))
+        self.assertIn("Cannot reach Immich", result["message"])
 
 
 class ServerTests(unittest.TestCase):

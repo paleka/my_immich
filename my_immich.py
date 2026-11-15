@@ -377,18 +377,55 @@ def browse(path):
             "crumbs": crumbs, "media_here": media_here(str(p)), "places": places(), "error": error}
 
 
+# Sent with every request to Immich. Python's default "Python-urllib/3.x" is on
+# the block list of Cloudflare and several reverse proxies, which answer 403
+# before the request ever reaches Immich; a named client passes.
+USER_AGENT = "my_immich (immich-go front end)"
+
+
+def immich_get(server, path, api_key="", timeout=10):
+    """GET a JSON document from the Immich API."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(server + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+
+def http_error_detail(exc):
+    """What an HTTP error page says, shortened: Immich's JSON message, or the
+    first line of a proxy's page (Cloudflare writes "error code: 1010")."""
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        return str(json.loads(body).get("message", ""))[:200]
+    except Exception:  # noqa: BLE001
+        pass
+    text = re.sub(r"<[^>]+>", " ", body)
+    return " ".join(text.split())[:120]
+
+
 def test_connection(cfg):
     server = cfg["server"]
     if not server:
         return {"ok": False, "message": "Enter the Immich server address first."}
-
-    def get(url, headers=None):
-        req = urllib.request.Request(url, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode() or "{}")
-
     try:
-        get(server + "/api/server/ping")
+        immich_get(server, "/api/server/ping")
+    except urllib.error.HTTPError as exc:
+        # Something answered, so the network is fine: say what it said.
+        detail = http_error_detail(exc)
+        if exc.code in (401, 403):
+            hint = ("A proxy or firewall in front of Immich (Cloudflare, an access gateway, a "
+                    "reverse proxy rule) is refusing this app before the request reaches Immich.")
+        elif exc.code == 404:
+            hint = "That address answers, but it does not look like Immich. Check the address and port."
+        else:
+            hint = "The server or a proxy in front of it returned an error."
+        return {"ok": False, "message": "%s answered HTTP %s %s. %s%s"
+                % (server, exc.code, exc.reason, hint, (" (%s)" % detail) if detail else "")}
     except Exception as exc:  # noqa: BLE001 - shown to the user as-is
         reason = getattr(exc, "reason", exc)
         return {"ok": False, "message": "Cannot reach Immich at %s. Check the address and that this Mac is on "
@@ -396,15 +433,10 @@ def test_connection(cfg):
     if not cfg["api_key"]:
         return {"ok": False, "message": "Server is reachable, but no API key is set."}
     try:
-        me = get(server + "/api/users/me", {"x-api-key": cfg["api_key"], "Accept": "application/json"})
+        me = immich_get(server, "/api/users/me", cfg["api_key"])
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = json.loads(exc.read().decode()).get("message", "")
-        except Exception:  # noqa: BLE001
-            pass
         return {"ok": False, "message": "Server reachable, but the API key was refused (HTTP %s). %s"
-                % (exc.code, detail)}
+                % (exc.code, http_error_detail(exc))}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": "Server reachable, but the key check failed (%s)." % exc}
     return {"ok": True, "message": "Connected as %s." % (me.get("name") or me.get("email") or "user")}
@@ -542,12 +574,9 @@ def server_stats(cfg):
     """A few numbers from the Immich server itself. Every part is optional: a key
     without the permission, or a server that answers differently, just leaves it out."""
     out = {}
-    headers = {"x-api-key": cfg["api_key"], "Accept": "application/json"}
 
     def get(path, auth=True):
-        req = urllib.request.Request(cfg["server"] + path, headers=headers if auth else {})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return json.loads(resp.read().decode() or "{}")
+        return immich_get(cfg["server"], path, cfg["api_key"] if auth else "", timeout=8)
 
     try:
         t0 = time.time()

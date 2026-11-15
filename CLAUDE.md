@@ -52,6 +52,10 @@ Top to bottom:
 - **Security:** keep the server bound to `127.0.0.1`; every `/api/` route
   except `/api/hello` must pass `_auth()` (token + Host check). Never log or
   return the API key unmasked — use `mask()`.
+- **Requests to Immich go through `immich_get`**, which sends `USER_AGENT`.
+  Python's default `Python-urllib` agent is refused with 403 by Cloudflare and
+  similar proxies, so a bare `urlopen` works on the LAN and fails on a public
+  domain.
 - **Config file** is written with mode 600 and holds the API key. Never write
   it inside the project folder; `.gitignore` excludes `config.json` as a
   backstop.
