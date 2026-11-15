@@ -1,0 +1,3 @@
+# Only needed for the macOS menu-bar icon (--tray). The page itself uses the
+# Python standard library alone.
+rumps>=0.4.0

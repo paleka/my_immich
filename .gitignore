@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+# Never commit settings: config.json holds the Immich API key.
+config.json
+*.log
