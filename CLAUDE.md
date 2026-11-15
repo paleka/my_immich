@@ -25,12 +25,16 @@ Top to bottom:
 1. Constants: `DEFAULTS` (every setting and its default), `ENUMS` (allowed
    values for the dropdowns).
 2. Config: `clean_config`, `load_config`, `save_config`, `import_old_script`.
-3. Environment: `find_immich_go`, `list_cards`, `scan_folder`, `browse`,
-   `test_connection`.
+3. Environment: `find_immich_go`, `list_cards`, `list_drives`, `scan_folder`,
+   `places` and `browse` (the folder chooser), `test_connection`.
 4. Job: `build_command` (settings → immich-go arguments), `Job` (runs the
    child process and buffers its log), `eject_for`.
 5. HTTP: `Handler` with the JSON API under `/api/…`.
-6. `PAGE`: the whole web page (HTML, CSS, JS) as one string.
+6. `PAGE`: the whole web page (HTML, CSS, JS) as one raw string. It is an app
+   shell: sidebar navigation, an Import view and a Settings view, and a
+   `<dialog>` folder chooser. Colours and radii are CSS variables at the top;
+   amber is the single accent and the SD-card shape is the one decorative motif.
+   System fonts only, so it works offline. Keep light and dark in step.
 7. `run_tray` (rumps menu-bar app) and `main`.
 
 ## Rules to keep

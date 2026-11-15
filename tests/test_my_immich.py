@@ -55,6 +55,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(c["raw_jpeg"], app.DEFAULTS["raw_jpeg"])   # bad enum ignored
         self.assertFalse(c["session_tag"])
 
+    def test_recent_folders_are_kept_and_capped(self):
+        c = app.clean_config({"recent_folders": ["/a", "/b", 3, ""] + ["/x%d" % i for i in range(10)]})
+        self.assertEqual(c["recent_folders"][:2], ["/a", "/b"])
+        self.assertEqual(len(c["recent_folders"]), app.MAX_RECENT)
+        self.assertEqual(app.clean_config({})["recent_folders"], [])
+
     def test_on_errors_accepts_a_count(self):
         self.assertEqual(app.clean_config({"on_errors": "5"})["on_errors"], "5")
         self.assertEqual(app.clean_config({"on_errors": "whatever"})["on_errors"], "stop")
@@ -127,6 +133,27 @@ class SourceTests(unittest.TestCase):
     def test_browse_lists_folders(self):
         listing = app.browse(str(CARD))
         self.assertEqual(listing["dirs"], ["DCIM", "MISC"])
+        self.assertIsNone(listing["error"])
+        self.assertEqual(listing["crumbs"][-1]["label"], "EOS_DIGITAL")
+        self.assertEqual(listing["crumbs"][-1]["path"], listing["path"])
+
+    def test_browse_reports_missing_folder(self):
+        listing = app.browse("/definitely/not/here")
+        self.assertIn("does not exist", listing["error"])
+
+    def test_browse_counts_media_in_folder(self):
+        self.assertEqual(app.browse(str(CARD / "DCIM" / "100CANON"))["media_here"], 1)
+        self.assertEqual(app.browse(str(CARD / "DCIM"))["media_here"], 0)
+
+    def test_drives_exclude_cards(self):
+        names = [d["name"] for d in app.list_drives()]
+        self.assertIn("Macintosh HD", names)       # a plain folder here; the real startup disk is skipped
+        self.assertNotIn("EOS_DIGITAL", names)
+
+    def test_places_include_card_and_drive(self):
+        kinds = {p["label"]: p["kind"] for p in app.places()}
+        self.assertEqual(kinds["EOS_DIGITAL"], "card")
+        self.assertEqual(kinds["Macintosh HD"], "drive")
 
 
 class JobTests(unittest.TestCase):

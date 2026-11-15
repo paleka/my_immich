@@ -74,7 +74,9 @@ DEFAULTS = {
     "eject_after": False,
     "extra_args": "",
     "last_folder": "",
+    "recent_folders": [],
 }
+MAX_RECENT = 6
 ENUMS = {
     "raw_jpeg": RAW_JPEG, "burst": BURST, "heic_jpeg": HEIC_JPEG,
     "folder_as_album": FOLDER_ALBUM, "include_type": INCLUDE_TYPE, "on_errors": ON_ERRORS,
@@ -118,11 +120,15 @@ def import_old_script():
 
 
 def clean_config(data):
-    cfg = dict(DEFAULTS)
+    cfg = dict(DEFAULTS, recent_folders=[])
     for key, default in DEFAULTS.items():
         if key not in data:
             continue
         value = data[key]
+        if isinstance(default, list):
+            if isinstance(value, list):
+                cfg[key] = [str(v) for v in value if isinstance(v, str) and v][:MAX_RECENT]
+            continue
         if isinstance(default, bool):
             cfg[key] = bool(value)
         else:
@@ -201,6 +207,45 @@ def list_cards():
     return cards
 
 
+def list_drives():
+    """Other mounted volumes (USB sticks, external disks): everything under the
+    volumes root that is neither the startup disk nor a camera card."""
+    drives = []
+    try:
+        entries = sorted(VOLUMES_ROOT.iterdir(), key=lambda v: v.name.lower())
+    except OSError:
+        return drives
+    for vol in entries:
+        try:
+            if vol.name.startswith(".") or not vol.is_dir():
+                continue
+            if os.path.realpath(str(vol)) == "/":        # the startup disk
+                continue
+            if (vol / "DCIM").is_dir():                  # listed as a card instead
+                continue
+        except OSError:
+            continue
+        drives.append({"name": vol.name, "path": str(vol)})
+    return drives
+
+
+def media_here(path, limit=5000):
+    """How many media files sit directly in a folder (not in its subfolders)."""
+    count = seen = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                seen += 1
+                if seen > limit:
+                    break
+                name = entry.name
+                if not name.startswith(".") and os.path.splitext(name)[1].lower() in MEDIA_EXT:
+                    count += 1
+    except OSError:
+        return None
+    return count
+
+
 def scan_folder(path):
     count = size = 0
     for root, dirs, files in os.walk(path):
@@ -216,11 +261,30 @@ def scan_folder(path):
     return {"files": count, "bytes": size}
 
 
+def places():
+    home = Path.home()
+    out = [{"label": "Home", "path": str(home), "kind": "home"}]
+    for name in ("Pictures", "Desktop", "Downloads", "Documents", "Movies"):
+        if (home / name).is_dir():
+            out.append({"label": name, "path": str(home / name), "kind": "folder"})
+    for card in list_cards():
+        out.append({"label": card["name"], "path": card["volume"], "kind": "card"})
+    for drive in list_drives():
+        out.append({"label": drive["name"], "path": drive["path"], "kind": "drive"})
+    return out
+
+
 def browse(path):
-    p = Path(path or Path.home()).expanduser()
-    if not p.is_dir():
-        p = Path.home()
-    p = p.resolve()
+    """Folder listing for the folder chooser."""
+    error = None
+    p = Path(path).expanduser() if path else Path.home()
+    try:
+        if not p.is_dir():
+            error = "That folder does not exist: %s" % p
+            p = Path.home()
+        p = p.resolve()
+    except OSError as exc:
+        error, p = str(exc), Path.home()
     dirs = []
     try:
         for child in sorted(p.iterdir(), key=lambda c: c.name.lower()):
@@ -231,11 +295,16 @@ def browse(path):
                     dirs.append(child.name)
             except OSError:
                 pass
+    except PermissionError:
+        error = ("macOS did not allow reading this folder. Allow my_immich (Python) under "
+                 "System Settings, Privacy & Security, Files and Folders, then try again.")
     except OSError as exc:
-        return {"path": str(p), "parent": str(p.parent), "dirs": [], "error": str(exc)}
+        error = str(exc)
+    crumbs, parts = [], p.parts
+    for i in range(len(parts)):
+        crumbs.append({"label": parts[i] if i else "Computer", "path": str(Path(*parts[:i + 1]))})
     return {"path": str(p), "parent": str(p.parent) if p.parent != p else None, "dirs": dirs,
-            "shortcuts": [{"label": "Home", "path": str(Path.home())},
-                          {"label": "Volumes", "path": str(VOLUMES_ROOT)}]}
+            "crumbs": crumbs, "media_here": media_here(str(p)), "places": places(), "error": error}
 
 
 def test_connection(cfg):
@@ -251,7 +320,9 @@ def test_connection(cfg):
     try:
         get(server + "/api/server/ping")
     except Exception as exc:  # noqa: BLE001 - shown to the user as-is
-        return {"ok": False, "message": "Cannot reach %s (%s)." % (server, exc)}
+        reason = getattr(exc, "reason", exc)
+        return {"ok": False, "message": "Cannot reach Immich at %s. Check the address and that this Mac is on "
+                                        "the same network. (%s)" % (server, reason)}
     if not cfg["api_key"]:
         return {"ok": False, "message": "Server is reachable, but no API key is set."}
     try:
@@ -481,11 +552,11 @@ class Handler(BaseHTTPRequestHandler):
         cfg = STATE["config"]
         if url.path == "/api/state":
             return self._send(200, {
-                "config": cfg, "cards": list_cards(), "immich_go": find_immich_go(cfg),
+                "config": cfg, "cards": list_cards(), "drives": list_drives(), "immich_go": find_immich_go(cfg),
                 "config_file": str(CONFIG_FILE), "imported_from": STATE["imported_from"],
                 "options": ENUMS, "job": JOB.snapshot(10 ** 12)})
         if url.path == "/api/cards":
-            return self._send(200, {"cards": list_cards()})
+            return self._send(200, {"cards": list_cards(), "drives": list_drives()})
         if url.path == "/api/scan":
             path = query.get("path", [""])[0]
             if not os.path.isdir(path):
@@ -504,7 +575,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         cfg = STATE["config"]
         if self.path == "/api/config":
+            recent = cfg.get("recent_folders", [])
             cfg = clean_config(body)
+            cfg["recent_folders"] = recent
             STATE["config"] = cfg
             try:
                 save_config(cfg)
@@ -526,8 +599,9 @@ class Handler(BaseHTTPRequestHandler):
             error = JOB.start(cfg, source, bool(body.get("dry_run")))
             if error:
                 return self._send(200, {"ok": False, "message": error})
-            if volume_of(source) is None and cfg.get("last_folder") != source:
-                cfg["last_folder"] = source
+            if not any(c["path"] == source for c in list_cards()):
+                recent = [source] + [r for r in cfg.get("recent_folders", []) if r != source]
+                cfg["recent_folders"], cfg["last_folder"] = recent[:MAX_RECENT], source
                 try:
                     save_config(cfg)
                 except OSError:
@@ -551,144 +625,380 @@ PAGE = r"""<!DOCTYPE html>
 <title>my_immich</title>
 <style>
   :root {
-    --bg:#f4f5f7; --panel:#fff; --ink:#16181d; --muted:#667085; --line:#dfe3ea;
-    --accent:#3457d5; --accent-ink:#fff; --ok:#12805c; --bad:#c0362c; --warn:#a15c07;
-    --field:#fff; --log:#0f1218; --log-ink:#d7dce5;
+    color-scheme: light dark;
+    --canvas:#e9ebee; --side:#dfe2e6; --panel:#ffffff; --raised:#f5f6f8;
+    --ink:#1b1d22; --soft:#5d6470; --line:#d3d7de; --line-strong:#b9bfc9;
+    --amber:#e59a1f; --amber-deep:#a8690a; --amber-wash:#fdf3e0; --on-amber:#231703;
+    --good:#1c7c54; --bad:#b93a2e; --warn:#96600a;
+    --term:#14161a; --term-ink:#d5d9e0; --term-dim:#8a919d;
+    --r-s:7px; --r-m:11px; --r-l:16px;
+    --ui: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --text: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#101216; --panel:#181b21; --ink:#e8eaf0; --muted:#98a2b3; --line:#2a2f39;
-      --accent:#7c96ff; --accent-ink:#0d1020; --ok:#4cc79a; --bad:#ff7b72; --warn:#e0a44a;
-      --field:#12151a; --log:#0b0d11; --log-ink:#cfd5df; }
+    :root {
+      --canvas:#17181b; --side:#1c1e22; --panel:#22252a; --raised:#2a2d33;
+      --ink:#eceef2; --soft:#9aa1ad; --line:#33373e; --line-strong:#474c55;
+      --amber:#f0aa3c; --amber-deep:#f3bb62; --amber-wash:#33290f; --on-amber:#231703;
+      --good:#58c794; --bad:#ff8a7d; --warn:#ecb354;
+      --term:#101114; --term-ink:#d5d9e0; --term-dim:#7d8490;
+    }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-  header { padding:20px 24px 4px; max-width:1180px; margin:0 auto; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
-  header h1 { font-size:22px; margin:0; letter-spacing:-.01em; }
-  header .sub { color:var(--muted); font-size:13px; }
-  main { max-width:1180px; margin:0 auto; padding:14px 24px 40px; display:grid; gap:18px;
-    grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
-  @media (max-width:900px) { main { grid-template-columns:1fr; } }
-  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
-  section.wide { grid-column:1 / -1; }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 12px; }
-  label.row { display:grid; grid-template-columns:170px minmax(0,1fr); gap:12px; align-items:center; margin:9px 0; }
-  label.row > span { color:var(--muted); font-size:13.5px; }
-  input[type=text], input[type=password], select {
-    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
-    background:var(--field); color:var(--ink); font:inherit; }
-  input:focus, select:focus, button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
-  .checks { display:grid; grid-template-columns:1fr 1fr; gap:6px 16px; margin:12px 0 4px; }
-  .checks label { display:flex; gap:8px; align-items:flex-start; font-size:14px; }
-  .hint { color:var(--muted); font-size:12.5px; margin:4px 0 0; }
-  button { font:inherit; border-radius:8px; border:1px solid var(--line); background:var(--field);
-    color:var(--ink); padding:8px 14px; cursor:pointer; }
-  button.primary { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); font-weight:600; }
-  button.danger { color:var(--bad); border-color:var(--bad); }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
-  .status { font-size:13.5px; }
-  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .muted { color:var(--muted); }
-  .src { display:flex; gap:12px; align-items:flex-start; border:1px solid var(--line); border-radius:10px;
-    padding:12px 14px; margin:8px 0; cursor:pointer; }
-  .src.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
-  .src input { margin-top:3px; }
-  .src .name { font-weight:600; }
-  .src .meta { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
-  .badge { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.05em; padding:1px 7px;
-    border-radius:99px; background:var(--accent); color:var(--accent-ink); margin-left:6px; vertical-align:2px; }
-  .picker { border:1px solid var(--line); border-radius:10px; margin-top:8px; overflow:hidden; }
-  .picker .path { padding:8px 12px; font-size:13px; border-bottom:1px solid var(--line); display:flex; gap:8px;
-    align-items:center; flex-wrap:wrap; overflow-wrap:anywhere; }
-  .picker ul { list-style:none; margin:0; padding:4px 0; max-height:230px; overflow:auto; }
-  .picker li button { width:100%; text-align:left; border:0; border-radius:0; background:none; padding:6px 14px; }
-  .picker li button:hover { background:var(--bg); }
-  pre { margin:0; font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-  #cmd { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; color:var(--muted); }
-  #log { background:var(--log); color:var(--log-ink); border-radius:10px; padding:12px 14px; height:340px; overflow:auto; margin-top:12px; }
-  details summary { cursor:pointer; color:var(--muted); font-size:13.5px; margin-top:10px; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:14.5px/1.45 var(--text);
+    -webkit-font-smoothing:antialiased; }
+  button, input, select { font:inherit; color:inherit; }
+  :focus-visible { outline:2px solid var(--amber); outline-offset:2px; }
+
+  /* ---- shell */
+  .app { display:grid; grid-template-columns:216px minmax(0,1fr); height:100vh; }
+  .side { background:var(--side); border-right:1px solid var(--line); display:flex; flex-direction:column;
+    padding:18px 12px 14px; }
+  .brand { display:flex; align-items:center; gap:10px; padding:2px 8px 18px; }
+  .brand .mark { width:26px; height:32px; background:var(--amber); border-radius:4px;
+    clip-path:polygon(0 0, 68% 0, 100% 24%, 100% 100%, 0 100%); position:relative; flex:none; }
+  .brand .mark::after { content:""; position:absolute; left:5px; right:9px; top:5px; height:7px;
+    background:repeating-linear-gradient(90deg, var(--on-amber) 0 2px, transparent 2px 5px); opacity:.55; }
+  .brand b { font:600 17px/1 var(--ui); letter-spacing:-.01em; }
+  .nav { display:grid; gap:2px; }
+  .nav button { all:unset; display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:var(--r-s);
+    cursor:pointer; color:var(--soft); font-weight:500; }
+  .nav button:hover { background:color-mix(in srgb, var(--ink) 6%, transparent); color:var(--ink); }
+  .nav button[aria-current="page"] { background:var(--panel); color:var(--ink);
+    box-shadow:0 0 0 1px var(--line); }
+  .nav button:focus-visible { outline:2px solid var(--amber); outline-offset:2px; }
+  .nav svg { width:17px; height:17px; flex:none; }
+  .nav .pip { margin-left:auto; width:8px; height:8px; border-radius:50%; background:var(--amber); }
+  .health { margin-top:auto; display:grid; gap:8px; padding:12px 10px 0; border-top:1px solid var(--line);
+    font-size:12.5px; color:var(--soft); }
+  .health div { display:grid; grid-template-columns:10px minmax(0,1fr); gap:8px; align-items:start; }
+  .dot { width:8px; height:8px; border-radius:50%; margin-top:5px; background:var(--line-strong); }
+  .dot.good { background:var(--good); } .dot.bad { background:var(--bad); } .dot.busy { background:var(--amber); }
+  .health span { overflow-wrap:anywhere; }
+
+  main { min-width:0; height:100vh; display:flex; flex-direction:column; }
+  .view { display:none; flex:1; min-height:0; flex-direction:column; }
+  .view.on { display:flex; }
+  .head { padding:20px 28px 14px; display:flex; align-items:flex-end; gap:16px; flex-wrap:wrap; }
+  .head h1 { font:600 24px/1.1 var(--ui); margin:0; letter-spacing:-.015em; }
+  .head p { margin:0; color:var(--soft); }
+  .head .grow { flex:1; }
+
+  /* ---- controls */
+  .btn { border:1px solid var(--line-strong); background:var(--panel); border-radius:var(--r-s);
+    padding:7px 14px; cursor:pointer; font-weight:500; white-space:nowrap; }
+  .btn:hover:not(:disabled) { background:var(--raised); }
+  .btn.go { background:var(--amber); border-color:var(--amber); color:var(--on-amber); font-weight:650;
+    padding:10px 20px; border-radius:var(--r-m); font-size:15px; }
+  .btn.go:hover:not(:disabled) { background:color-mix(in srgb, var(--amber) 88%, #000); }
+  .btn.big { padding:10px 18px; border-radius:var(--r-m); font-size:15px; }
+  .btn.stop { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 55%, var(--line)); }
+  .btn.quiet { border-color:transparent; background:none; color:var(--soft); padding:6px 10px; }
+  .btn.quiet:hover:not(:disabled) { background:color-mix(in srgb, var(--ink) 7%, transparent); color:var(--ink); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=text], input[type=password], select { width:100%; padding:8px 10px; border:1px solid var(--line-strong);
+    border-radius:var(--r-s); background:var(--panel); }
+  .msg { font-size:13.5px; color:var(--soft); }
+  .msg.good { color:var(--good); } .msg.bad { color:var(--bad); } .msg.warn { color:var(--warn); }
+
+  /* ---- import view */
+  .work { flex:1; min-height:0; display:grid; grid-template-columns:minmax(280px, 380px) minmax(0,1fr);
+    gap:18px; padding:0 28px 24px; }
+  .col { min-height:0; display:flex; flex-direction:column; gap:10px; }
+  .col h2 { font:600 13.5px/1 var(--text); color:var(--soft); margin:6px 2px 2px; }
+  .sources { overflow:auto; display:grid; gap:10px; align-content:start; padding:2px; margin:-2px; }
+  .tile { display:grid; grid-template-columns:44px minmax(0,1fr); gap:14px; align-items:center;
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--r-l); padding:14px 16px;
+    cursor:pointer; position:relative; }
+  .tile:hover { border-color:var(--line-strong); }
+  .tile.sel { border-color:var(--amber); box-shadow:0 0 0 1px var(--amber); background:var(--amber-wash); }
+  .tile input[type=radio] { position:absolute; opacity:0; pointer-events:none; }
+  .tile:has(input:focus-visible) { outline:2px solid var(--amber); outline-offset:2px; }
+  .glyph { width:38px; height:48px; border-radius:5px; background:var(--raised); border:1px solid var(--line-strong);
+    position:relative; justify-self:center; }
+  .glyph.card { background:var(--amber); border:0; clip-path:polygon(0 0, 68% 0, 100% 22%, 100% 100%, 0 100%); }
+  .glyph.card::before { content:""; position:absolute; left:7px; right:12px; top:7px; height:10px;
+    background:repeating-linear-gradient(90deg, var(--on-amber) 0 3px, transparent 3px 7px); opacity:.5; }
+  .glyph.card::after { content:""; position:absolute; left:7px; right:7px; bottom:8px; height:13px; border-radius:2px;
+    background:color-mix(in srgb, #fff 55%, transparent); }
+  .glyph.dir { height:34px; margin-top:8px; border-radius:4px 6px 6px 6px; }
+  .glyph.dir::before { content:""; position:absolute; left:-1px; top:-7px; width:17px; height:8px;
+    border:1px solid var(--line-strong); border-bottom:0; border-radius:4px 4px 0 0; background:var(--raised); }
+  .tile .name { font:600 16px/1.2 var(--ui); overflow-wrap:anywhere; }
+  .tile .meta { color:var(--soft); font-size:13px; overflow-wrap:anywhere; margin-top:2px; }
+  .tile .count { font-size:13.5px; margin-top:6px; font-variant-numeric:tabular-nums; }
+  .chips { display:flex; gap:5px; flex-wrap:wrap; margin-top:7px; }
+  .chip { font-size:11.5px; padding:1px 8px; border-radius:99px; border:1px solid var(--line-strong);
+    color:var(--soft); background:var(--panel); }
+  .empty { border:1px dashed var(--line-strong); border-radius:var(--r-l); padding:18px 16px; color:var(--soft); }
+  .empty b { display:block; color:var(--ink); font:600 15px/1.3 var(--ui); margin-bottom:3px; }
+  .quick { display:grid; gap:8px; }
+  .quick .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .quick .row > span { color:var(--soft); font-size:12.5px; width:58px; flex:none; }
+  .quick button { all:unset; cursor:pointer; font-size:12.5px; padding:3px 10px; border-radius:99px;
+    border:1px solid var(--line-strong); background:var(--panel); max-width:100%; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; box-sizing:border-box; }
+  .quick button:hover { background:var(--raised); }
+  .quick button:focus-visible { outline:2px solid var(--amber); outline-offset:2px; }
+
+  dialog { border:1px solid var(--line-strong); border-radius:var(--r-l); padding:0; background:var(--panel);
+    color:var(--ink); width:min(860px, calc(100vw - 32px)); box-shadow:0 24px 70px rgba(0,0,0,.35); }
+  dialog::backdrop { background:rgba(10,12,16,.45); }
+  .chooser { display:flex; flex-direction:column; height:min(620px, calc(100vh - 64px)); }
+  .chooser header { padding:16px 18px 10px; border-bottom:1px solid var(--line); display:grid; gap:10px; }
+  .chooser header b { font:600 17px/1.2 var(--ui); }
+  .pathrow { display:flex; gap:8px; }
+  .pathrow input { font:12.5px var(--mono); }
+  .crumbs { display:flex; flex-wrap:wrap; gap:2px; align-items:center; font-size:13px; }
+  .crumbs button { all:unset; cursor:pointer; padding:2px 7px; border-radius:var(--r-s); color:var(--soft); }
+  .crumbs button:hover, .crumbs button:focus-visible { background:var(--raised); color:var(--ink); }
+  .crumbs button[aria-current] { color:var(--ink); font-weight:600; }
+  .crumbs i { color:var(--line-strong); font-style:normal; }
+  .panes { flex:1; min-height:0; display:grid; grid-template-columns:190px minmax(0,1fr); }
+  .places { list-style:none; margin:0; padding:8px; border-right:1px solid var(--line); overflow:auto;
+    background:var(--raised); }
+  .places li.sep { height:1px; background:var(--line); margin:6px 4px; }
+  .places button, .listing li button { all:unset; display:flex; align-items:center; gap:9px; width:100%;
+    box-sizing:border-box; padding:6px 9px; border-radius:var(--r-s); cursor:pointer; overflow:hidden; }
+  .places button span, .listing li button span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .places button:hover, .places button:focus-visible { background:color-mix(in srgb, var(--ink) 8%, transparent); }
+  .places button[aria-current] { background:var(--amber-wash); box-shadow:0 0 0 1px var(--amber) inset; }
+  .ico { width:15px; height:12px; border-radius:2px 3px 3px 3px; background:var(--line-strong); flex:none; position:relative; }
+  .ico::before { content:""; position:absolute; left:0; top:-3px; width:7px; height:3px; border-radius:2px 2px 0 0;
+    background:var(--line-strong); }
+  .ico.card { width:12px; height:15px; border-radius:2px; background:var(--amber);
+    clip-path:polygon(0 0, 66% 0, 100% 24%, 100% 100%, 0 100%); }
+  .ico.card::before { display:none; }
+  .ico.drive { height:11px; border-radius:3px; background:none; border:1.5px solid var(--soft); }
+  .ico.drive::before { left:auto; right:2px; top:2.5px; width:3px; height:3px; border-radius:50%; background:var(--soft); }
+  .listing { overflow:auto; padding:8px; }
+  .listing ul { list-style:none; margin:0; padding:0; }
+  .listing li button:hover, .listing li button:focus-visible { background:var(--raised); }
+  .listing .msg { margin:6px 9px; }
+  .chooser footer { border-top:1px solid var(--line); padding:12px 18px; display:flex; gap:10px; align-items:center;
+    flex-wrap:wrap; }
+  .chooser footer .grow { flex:1; }
+  .chooser footer .btn.go { padding:8px 16px; font-size:inherit; border-radius:var(--r-s); }
+  @media (max-width: 640px) { .panes { grid-template-columns:1fr; } .places { display:flex; flex-wrap:wrap; gap:2px;
+    border-right:0; border-bottom:1px solid var(--line); } .places button { width:auto; } .places li.sep { display:none; } }
+
+  .run { background:var(--panel); border:1px solid var(--line); border-radius:var(--r-l); padding:16px;
+    display:flex; flex-direction:column; gap:12px; min-height:0; flex:1; }
+  .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .actions .grow { flex:1; }
+  .state { display:flex; align-items:center; gap:10px; min-height:22px; }
+  .state .clock { font-variant-numeric:tabular-nums; color:var(--soft); font-size:13px; }
+  .meter { height:3px; border-radius:2px; background:var(--line); overflow:hidden; visibility:hidden; }
+  .meter.on { visibility:visible; }
+  .meter i { display:block; height:100%; width:30%; background:var(--amber); border-radius:2px;
+    animation:slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { transform:translateX(-110%); } 100% { transform:translateX(360%); } }
+  @media (prefers-reduced-motion: reduce) { .meter i { animation:none; width:100%; opacity:.6; } }
+  details.cmd summary { cursor:pointer; color:var(--soft); font-size:13px; width:max-content; }
+  details.cmd pre { margin:8px 0 0; padding:10px 12px; background:var(--raised); border-radius:var(--r-s);
+    font:12px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; color:var(--soft); }
+  #log { flex:1; min-height:160px; margin:0; overflow:auto; background:var(--term); color:var(--term-ink);
+    border-radius:var(--r-m); padding:12px 14px; font:12px/1.55 var(--mono); white-space:pre-wrap;
+    overflow-wrap:anywhere; }
+  #log.idle { color:var(--term-dim); display:grid; place-items:center; text-align:center; font-family:var(--text);
+    font-size:13.5px; white-space:normal; }
+
+  /* ---- settings view */
+  .form { flex:1; min-height:0; overflow:auto; padding:0 28px 8px; }
+  .group { background:var(--panel); border:1px solid var(--line); border-radius:var(--r-l); max-width:760px;
+    margin:0 0 16px; }
+  .group h2 { font:600 15px/1.2 var(--ui); margin:0; padding:14px 18px 4px; }
+  .group .note { margin:0; padding:0 18px 8px; color:var(--soft); font-size:13px; }
+  .field { display:grid; grid-template-columns:minmax(150px, 230px) minmax(0,1fr); gap:6px 18px; align-items:center;
+    padding:10px 18px; border-top:1px solid var(--line); }
+  .field > label, .field > .lab { font-weight:500; }
+  .field small { display:block; color:var(--soft); font-weight:400; font-size:12.5px; margin-top:1px; }
+  .field .inline { display:flex; gap:8px; }
+  .switch { justify-self:end; position:relative; width:40px; height:24px; flex:none; }
+  .switch input { position:absolute; inset:0; opacity:0; margin:0; cursor:pointer; width:100%; height:100%; }
+  .switch i { position:absolute; inset:0; border-radius:99px; background:var(--line-strong); pointer-events:none;
+    transition:background .15s; }
+  .switch i::after { content:""; position:absolute; left:2px; top:2px; width:20px; height:20px; border-radius:50%;
+    background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s; }
+  .switch input:checked + i { background:var(--amber); }
+  .switch input:checked + i::after { transform:translateX(16px); }
+  .switch input:focus-visible + i { outline:2px solid var(--amber); outline-offset:2px; }
+  @media (prefers-reduced-motion: reduce) { .switch i, .switch i::after { transition:none; } }
+  .savebar { border-top:1px solid var(--line); background:var(--canvas); padding:12px 28px; display:flex; gap:10px;
+    align-items:center; flex-wrap:wrap; }
+  .savebar .file { margin-left:auto; font-size:12px; color:var(--soft); overflow-wrap:anywhere; max-width:46ch;
+    text-align:right; }
+
+  @media (max-width: 860px) {
+    .app { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); height:auto; min-height:100vh; }
+    .side { flex-direction:row; align-items:center; gap:10px; padding:10px 12px; border-right:0;
+      border-bottom:1px solid var(--line); flex-wrap:wrap; }
+    .brand { padding:0 6px 0 2px; } .nav { display:flex; } .health { display:none; }
+    main { height:auto; } .work { grid-template-columns:1fr; padding:0 16px 20px; }
+    .head { padding:16px 16px 10px; } .form { padding:0 16px 8px; } .savebar { padding:12px 16px; }
+    .field { grid-template-columns:1fr; } .switch { justify-self:start; }
+    #log { min-height:260px; } .savebar .file { margin-left:0; text-align:left; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>my_immich</h1>
-  <span class="sub" id="envline">Loading…</span>
-</header>
-<main>
-  <section>
-    <h2>Source</h2>
-    <div id="cards"></div>
-    <label class="src" id="folderSrc">
-      <input type="radio" name="src" value="__folder__">
-      <div style="flex:1; min-width:0">
-        <div class="name">Other folder</div>
-        <div class="meta" id="folderPath">No folder chosen</div>
-        <div class="bar" style="margin-top:8px">
-          <button type="button" id="browseBtn">Choose folder…</button>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><span class="mark" aria-hidden="true"></span><b>my_immich</b></div>
+    <nav class="nav" aria-label="Sections">
+      <button type="button" data-view="import" aria-current="page">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13V3M6 7l4-4 4 4M3 13v2.5A1.5 1.5 0 0 0 4.5 17h11a1.5 1.5 0 0 0 1.5-1.5V13"/></svg>
+        Import</button>
+      <button type="button" data-view="settings">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M3 6h8M15 6h2M3 14h2M9 14h8"/><circle cx="13" cy="6" r="2"/><circle cx="7" cy="14" r="2"/></svg>
+        Settings<span class="pip" id="dirtyPip" hidden title="Unsaved changes"></span></button>
+    </nav>
+    <div class="health">
+      <div><i class="dot" id="srvDot"></i><span id="srvText">Checking Immich…</span></div>
+      <div><i class="dot" id="goDot"></i><span id="goText">Looking for immich-go…</span></div>
+    </div>
+  </aside>
+
+  <main>
+    <!-- Import -->
+    <section class="view on" id="view-import" aria-labelledby="h-import">
+      <div class="head">
+        <div><h1 id="h-import">Import</h1><p id="sourceLine">Choose what to import.</p></div>
+      </div>
+      <div class="work">
+        <div class="col">
+          <h2>From</h2>
+          <div class="sources">
+            <div id="cards"></div>
+            <label class="tile" id="folderSrc">
+              <input type="radio" name="src" value="__folder__">
+              <span class="glyph dir" aria-hidden="true"></span>
+              <span>
+                <span class="name">A folder</span>
+                <span class="meta" id="folderPath" style="display:block">Any folder, USB drive or external disk</span>
+                <span class="count" id="folderCount" style="display:block" hidden></span>
+                <span class="chips"><button type="button" class="btn" id="browseBtn">Choose folder</button></span>
+              </span>
+            </label>
+          </div>
+          <div class="quick" id="quick"></div>
+          <div class="actions">
+            <button type="button" class="btn quiet" id="rescan">Look for cards and drives again</button>
+            <span class="msg" id="scanInfo"></span>
+          </div>
         </div>
-        <div class="picker" id="picker" hidden>
-          <div class="path"><span id="pickPath"></span></div>
-          <ul id="pickList"></ul>
-          <div class="path" style="border-top:1px solid var(--line); border-bottom:0">
-            <button type="button" class="primary" id="pickUse">Use this folder</button>
-            <button type="button" id="pickCancel">Cancel</button>
-            <span id="pickShort"></span>
+
+        <div class="col">
+          <h2>To Immich</h2>
+          <div class="run">
+            <div class="actions">
+              <button type="button" class="btn go" id="run">Import to Immich</button>
+              <button type="button" class="btn big" id="dry">Preview first</button>
+              <button type="button" class="btn big stop" id="stop" hidden>Stop</button>
+              <span class="grow"></span>
+              <button type="button" class="btn quiet" id="eject" hidden>Eject card</button>
+            </div>
+            <div class="state"><span class="msg" id="runInfo">A preview shows what would be uploaded without sending anything.</span>
+              <span class="clock" id="clock"></span></div>
+            <div class="meter" id="meter"><i></i></div>
+            <details class="cmd"><summary>Show the immich-go command</summary><pre id="cmd"></pre></details>
+            <pre id="log" class="idle" aria-live="polite">The import log appears here.</pre>
           </div>
         </div>
       </div>
-    </label>
-    <div class="bar">
-      <button type="button" id="rescan">Rescan for cards</button>
-      <span class="status muted" id="scanInfo"></span>
-    </div>
-  </section>
+    </section>
 
-  <section>
-    <h2>Settings</h2>
-    <label class="row"><span>Immich server</span><input type="text" id="server" placeholder="http://192.168.1.10:2283" spellcheck="false"></label>
-    <label class="row"><span>API key</span>
-      <span style="display:flex; gap:8px"><input type="password" id="api_key" autocomplete="off" spellcheck="false">
-      <button type="button" id="showKey">Show</button></span></label>
-    <label class="row"><span>RAW + JPEG pairs</span><select id="raw_jpeg"></select></label>
-    <label class="row"><span>Bursts</span><select id="burst"></select></label>
-    <label class="row"><span>If a file fails</span><select id="on_errors"></select></label>
-    <div class="checks">
-      <label><input type="checkbox" id="session_tag"> Tag each import with its time</label>
-      <label><input type="checkbox" id="pause_jobs"> Pause Immich jobs while uploading</label>
-      <label><input type="checkbox" id="keep_awake"> Keep the Mac awake</label>
-      <label><input type="checkbox" id="eject_after"> Eject the card when done</label>
-    </div>
-    <details>
-      <summary>More options</summary>
-      <label class="row"><span>HEIC + JPEG pairs</span><select id="heic_jpeg"></select></label>
-      <label class="row"><span>Albums from folders</span><select id="folder_as_album"></select></label>
-      <label class="row"><span>Put all into album</span><input type="text" id="into_album" placeholder="leave empty for none"></label>
-      <label class="row"><span>Upload</span><select id="include_type"></select></label>
-      <label class="row"><span>immich-go path</span><input type="text" id="immich_go_path" placeholder="found automatically" spellcheck="false"></label>
-      <label class="row"><span>Extra arguments</span><input type="text" id="extra_args" placeholder="e.g. --date-range=2026" spellcheck="false"></label>
-      <div class="checks"><label><input type="checkbox" id="recursive"> Include subfolders</label></div>
-    </details>
-    <div class="bar">
-      <button type="button" class="primary" id="save">Save settings</button>
-      <button type="button" id="test">Test connection</button>
-      <span class="status" id="saveInfo"></span>
-    </div>
-    <p class="hint" id="cfgPath"></p>
-  </section>
+    <!-- Settings -->
+    <section class="view" id="view-settings" aria-labelledby="h-settings">
+      <div class="head"><div><h1 id="h-settings">Settings</h1><p>Used for every import until you change them.</p></div></div>
+      <div class="form" id="settingsForm">
+        <div class="group">
+          <h2>Immich server</h2>
+          <div class="field"><label for="server">Address</label>
+            <input type="text" id="server" placeholder="http://192.168.1.10:2283" spellcheck="false" autocomplete="off"></div>
+          <div class="field"><label for="api_key">API key<small>From Immich, Account Settings, API Keys</small></label>
+            <span class="inline"><input type="password" id="api_key" autocomplete="off" spellcheck="false">
+              <button type="button" class="btn" id="showKey">Show</button></span></div>
+          <div class="field"><span class="lab">Connection</span>
+            <span class="inline" style="align-items:center"><button type="button" class="btn" id="test">Test connection</button>
+              <span class="msg" id="testInfo"></span></span></div>
+        </div>
 
-  <section class="wide">
-    <h2>Import</h2>
-    <pre id="cmd">—</pre>
-    <div class="bar">
-      <button type="button" id="dry">Preview (dry run)</button>
-      <button type="button" class="primary" id="run">Import to Immich</button>
-      <button type="button" class="danger" id="stop" disabled>Stop</button>
-      <button type="button" id="eject" hidden>Eject card</button>
-      <span class="status" id="runInfo"></span>
+        <div class="group">
+          <h2>What gets uploaded</h2>
+          <div class="field"><label for="raw_jpeg">RAW + JPEG pairs<small>When a shot exists as both</small></label><select id="raw_jpeg"></select></div>
+          <div class="field"><label for="burst">Bursts</label><select id="burst"></select></div>
+          <div class="field"><label for="heic_jpeg">HEIC + JPEG pairs</label><select id="heic_jpeg"></select></div>
+          <div class="field"><label for="include_type">Kinds of files</label><select id="include_type"></select></div>
+          <div class="field"><label for="recursive">Include subfolders<small>Needed for cards laid out as DCIM/100CANON</small></label>
+            <span class="switch"><input type="checkbox" id="recursive"><i></i></span></div>
+        </div>
+
+        <div class="group">
+          <h2>Organizing</h2>
+          <div class="field"><label for="session_tag">Tag each import with its time<small>Makes a batch easy to find later</small></label>
+            <span class="switch"><input type="checkbox" id="session_tag"><i></i></span></div>
+          <div class="field"><label for="folder_as_album">Albums from folders</label><select id="folder_as_album"></select></div>
+          <div class="field"><label for="into_album">Put everything in one album</label>
+            <input type="text" id="into_album" placeholder="Leave empty for none"></div>
+        </div>
+
+        <div class="group">
+          <h2>While importing</h2>
+          <div class="field"><label for="on_errors">If a file fails</label><select id="on_errors"></select></div>
+          <div class="field"><label for="pause_jobs">Pause Immich's background jobs<small>Needs an admin API key</small></label>
+            <span class="switch"><input type="checkbox" id="pause_jobs"><i></i></span></div>
+          <div class="field"><label for="keep_awake">Keep this Mac awake</label>
+            <span class="switch"><input type="checkbox" id="keep_awake"><i></i></span></div>
+          <div class="field"><label for="eject_after">Eject the card when done<small>Only after a real import succeeds</small></label>
+            <span class="switch"><input type="checkbox" id="eject_after"><i></i></span></div>
+        </div>
+
+        <div class="group">
+          <h2>Advanced</h2>
+          <div class="field"><label for="immich_go_path">immich-go location<small>Leave empty to find it automatically</small></label>
+            <input type="text" id="immich_go_path" spellcheck="false" placeholder="/opt/homebrew/bin/immich-go"></div>
+          <div class="field"><label for="extra_args">Extra arguments<small>Passed to immich-go as written</small></label>
+            <input type="text" id="extra_args" spellcheck="false" placeholder="--date-range=2026"></div>
+        </div>
+      </div>
+      <div class="savebar">
+        <button type="button" class="btn go" style="padding:8px 18px" id="save">Save settings</button>
+        <button type="button" class="btn" id="revert" hidden>Discard changes</button>
+        <span class="msg" id="saveInfo"></span>
+        <span class="file" id="cfgPath"></span>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="picker" aria-labelledby="pickTitle">
+  <form method="dialog" class="chooser" id="pickForm">
+    <header>
+      <b id="pickTitle">Choose a folder to import</b>
+      <div class="pathrow">
+        <input type="text" id="pickInput" spellcheck="false" autocomplete="off" aria-label="Folder path">
+        <button type="button" class="btn" id="pickGo">Go</button>
+      </div>
+      <nav class="crumbs" id="pickCrumbs" aria-label="Path"></nav>
+    </header>
+    <div class="panes">
+      <ul class="places" id="pickPlaces" aria-label="Places"></ul>
+      <div class="listing">
+        <p class="msg bad" id="pickError" hidden></p>
+        <ul id="pickList" aria-label="Folders"></ul>
+      </div>
     </div>
-    <pre id="log" aria-live="polite">Nothing has run yet.</pre>
-  </section>
-</main>
+    <footer>
+      <span class="msg" id="pickInfo"></span>
+      <span class="grow"></span>
+      <button type="button" class="btn" id="pickCancel">Cancel</button>
+      <button type="button" class="btn go" id="pickUse">Use this folder</button>
+    </footer>
+  </form>
+</dialog>
 
 <script>
 const TOKEN = "__TOKEN__";
@@ -706,7 +1016,9 @@ const LABELS = {
   include_type:{all:"Photos and videos",IMAGE:"Photos only",VIDEO:"Videos only"},
   on_errors:{stop:"Stop the import",continue:"Skip it and continue"}
 };
-let state = null, selected = null, folder = "", logNext = 0, polling = null, pickAt = "", dirty = false;
+let state = null, selected = null, folder = "", logNext = 0, polling = null, ticking = null,
+    pickAt = "", dirty = false, running = false;
+const scans = {};
 
 async function api(path, body) {
   const opt = {headers:{"X-Token":TOKEN}};
@@ -720,8 +1032,24 @@ function fmtBytes(n) {
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return (i ? n.toFixed(1) : n) + " " + u[i];
 }
-function setInfo(el, text, cls) { el.textContent = text; el.className = "status " + (cls || "muted"); }
+function fmtTime(s) {
+  s = Math.max(0, Math.round(s)); const m = Math.floor(s / 60), h = Math.floor(m / 60);
+  return h ? h + "h " + (m % 60) + "m" : m ? m + "m " + (s % 60) + "s" : s + "s";
+}
+function say(el, text, cls) { el.textContent = text; el.className = "msg" + (cls ? " " + cls : ""); }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
 
+/* ---- navigation */
+function show(view) {
+  for (const b of document.querySelectorAll(".nav button")) {
+    if (b.dataset.view === view) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  }
+  for (const v of document.querySelectorAll(".view")) v.classList.toggle("on", v.id === "view-" + view);
+  if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
+}
+document.querySelectorAll(".nav button").forEach(b => b.onclick = () => show(b.dataset.view));
+
+/* ---- settings */
 function fillForm(cfg) {
   for (const k of Object.keys(state.options)) {
     const sel = $(k); sel.innerHTML = "";
@@ -734,7 +1062,7 @@ function fillForm(cfg) {
   }
   for (const k of FIELDS) $(k).value = cfg[k];
   for (const k of CHECKS) $(k).checked = !!cfg[k];
-  dirty = false;
+  setDirty(false);
 }
 function readForm() {
   const cfg = Object.assign({}, state.config);
@@ -743,28 +1071,76 @@ function readForm() {
   cfg.last_folder = folder || cfg.last_folder || "";
   return cfg;
 }
-function currentSource() { return selected === "__folder__" ? folder : selected; }
+function setDirty(on) {
+  dirty = on; $("dirtyPip").hidden = !on; $("revert").hidden = !on;
+  if (on) say($("saveInfo"), "You have unsaved changes.", "warn");
+}
+$("settingsForm").addEventListener("input", e => { if (e.target.id !== "showKey") setDirty(true); });
+$("showKey").onclick = () => { const k = $("api_key"); const reveal = k.type === "password";
+  k.type = reveal ? "text" : "password"; $("showKey").textContent = reveal ? "Hide" : "Show"; };
+async function save() {
+  let r;
+  try { r = await api("/api/config", readForm()); }
+  catch (e) { say($("saveInfo"), "Could not save. Is the app still running?", "bad"); return false; }
+  if (!r.ok) { say($("saveInfo"), r.message, "bad"); return false; }
+  state.config = r.config; state.immich_go = r.immich_go; fillForm(r.config);
+  say($("saveInfo"), "Settings saved.", "good"); health(); updatePreview(); checkServer(); return true;
+}
+$("save").onclick = save;
+$("revert").onclick = () => { fillForm(state.config); say($("saveInfo"), "Changes discarded."); };
+$("test").onclick = async () => {
+  if (dirty && !(await save())) return;
+  say($("testInfo"), "Testing…");
+  const r = await checkServer(); say($("testInfo"), r.message, r.ok ? "good" : "bad");
+};
+async function checkServer() {
+  $("srvDot").className = "dot busy"; $("srvText").textContent = "Checking Immich…";
+  let r;
+  try { r = await api("/api/test", {}); } catch (e) { r = {ok:false, message:"Could not check the connection."}; }
+  $("srvDot").className = "dot " + (r.ok ? "good" : "bad");
+  $("srvText").textContent = r.ok ? "Immich: " + r.message.replace(/\.$/, "").replace(/^Connected/, "connected") : r.message;
+  return r;
+}
+function health() {
+  $("goDot").className = "dot " + (state.immich_go ? "good" : "bad");
+  $("goText").textContent = state.immich_go ? "immich-go is installed" : "immich-go is missing. Install it with: brew install immich-go";
+  $("goText").title = state.immich_go || "";
+  $("cfgPath").textContent = "Saved in " + state.config_file + ", which also holds your API key." +
+    (state.imported_from ? " First values came from " + state.imported_from + "." : "");
+}
 
+/* ---- sources */
+function currentSource() { return selected === "__folder__" ? folder : selected; }
+function describeSource() {
+  const src = currentSource(); const line = $("sourceLine");
+  if (!src) { line.textContent = "Choose what to import."; return; }
+  const card = state.cards.find(c => c.path === src);
+  const name = card ? card.name : src; const sc = scans[src];
+  line.textContent = name + (sc && !sc.error ? ", " + sc.files.toLocaleString() + " photos and videos, " + fmtBytes(sc.bytes) : "");
+}
+function scan(path, target) {
+  if (scans[path]) { if (target) target.textContent = countText(scans[path]); return; }
+  api("/api/scan?path=" + encodeURIComponent(path)).then(x => {
+    scans[path] = x; if (target) target.textContent = countText(x); describeSource();
+  }).catch(() => { if (target) target.textContent = ""; });
+}
+function countText(x) { return x.error ? x.error : x.files.toLocaleString() + " photos and videos, " + fmtBytes(x.bytes); }
 function renderCards() {
-  const box = $("cards"); box.innerHTML = "";
+  const box = $("cards"); box.innerHTML = ""; box.style.display = "grid"; box.style.gap = "10px";
   if (!state.cards.length) {
-    const p = document.createElement("p"); p.className = "hint";
-    p.textContent = "No camera card found. Insert one and press Rescan, or choose a folder below.";
-    box.appendChild(p);
+    const e = el("div", "empty"); e.appendChild(el("b", "", "No camera card found"));
+    e.appendChild(document.createTextNode("Insert a card, then look again. Or import from a folder."));
+    box.appendChild(e);
   }
   for (const c of state.cards) {
-    const lab = document.createElement("label"); lab.className = "src";
+    const lab = el("label", "tile");
     const r = document.createElement("input"); r.type = "radio"; r.name = "src"; r.value = c.path;
-    const d = document.createElement("div"); d.style.minWidth = "0";
-    const n = document.createElement("div"); n.className = "name"; n.textContent = c.name;
-    const b = document.createElement("span"); b.className = "badge"; b.textContent = "SD CARD"; n.appendChild(b);
-    const m = document.createElement("div"); m.className = "meta";
-    m.textContent = c.path + (c.folders.length ? " · " + c.folders.join(", ") : "");
-    const s = document.createElement("div"); s.className = "meta"; s.dataset.scan = c.path; s.textContent = "Counting files…";
-    d.append(n, m, s); lab.append(r, d); box.appendChild(lab);
-    api("/api/scan?path=" + encodeURIComponent(c.path)).then(x => {
-      s.textContent = x.error ? x.error : x.files.toLocaleString() + " photos and videos · " + fmtBytes(x.bytes);
-    }).catch(() => { s.textContent = ""; });
+    const g = el("span", "glyph card"); g.setAttribute("aria-hidden", "true");
+    const d = el("span");
+    d.appendChild(el("span", "name", c.name));
+    const cnt = el("span", "count", "Counting files…"); cnt.style.display = "block"; d.appendChild(cnt);
+    if (c.folders.length) { const ch = el("span", "chips"); for (const f of c.folders) ch.appendChild(el("span", "chip", f)); d.appendChild(ch); }
+    lab.append(r, g, d); box.appendChild(lab); scan(c.path, cnt);
   }
   const paths = state.cards.map(c => c.path);
   if (!selected || (selected !== "__folder__" && !paths.includes(selected))) {
@@ -774,124 +1150,160 @@ function renderCards() {
 }
 function syncSelection() {
   document.querySelectorAll('input[name="src"]').forEach(r => {
-    r.checked = r.value === selected;
-    r.closest(".src").classList.toggle("sel", r.checked);
+    r.checked = r.value === selected; r.closest(".tile").classList.toggle("sel", r.checked);
   });
-  $("folderPath").textContent = folder || "No folder chosen";
-  const onCard = selected && selected !== "__folder__";
-  $("eject").hidden = !onCard;
-  updatePreview();
+  $("folderPath").textContent = folder || "Any folder, USB drive or external disk";
+  const fc = $("folderCount"); fc.hidden = !folder;
+  if (folder) { fc.textContent = "Counting files…"; scan(folder, fc); }
+  $("eject").hidden = !(selected && selected !== "__folder__");
+  describeSource(); updatePreview();
 }
 document.addEventListener("change", e => {
-  if (e.target.name === "src") { selected = e.target.value; syncSelection(); }
+  if (e.target.name !== "src") return;
+  if (e.target.value === "__folder__" && !folder) { openPicker(state.config.last_folder || ""); }
+  selected = e.target.value; syncSelection();
 });
-
 async function updatePreview() {
   if (!state) return;
-  try {
-    const r = await api("/api/preview", {source: currentSource() || "", dry_run: false});
-    $("cmd").textContent = r.command + (dirty ? "\n(unsaved settings changes are not included yet)" : "");
-  } catch (e) { /* ignore */ }
+  try { const r = await api("/api/preview", {source: currentSource() || "", dry_run: false}); $("cmd").textContent = r.command; }
+  catch (e) { /* preview is optional */ }
 }
-
 async function openPicker(path) {
-  const r = await api("/api/browse?path=" + encodeURIComponent(path || ""));
-  pickAt = r.path; $("picker").hidden = false; $("pickPath").textContent = r.path;
-  const ul = $("pickList"); ul.innerHTML = "";
-  const add = (label, target) => {
-    const li = document.createElement("li"); const b = document.createElement("button");
-    b.type = "button"; b.textContent = label; b.onclick = () => openPicker(target); li.appendChild(b); ul.appendChild(li);
+  let r;
+  try { r = await api("/api/browse?path=" + encodeURIComponent(path || "")); }
+  catch (e) { return; }
+  pickAt = r.path; $("pickInput").value = r.path;
+  const dlg = $("picker"); if (!dlg.open) dlg.showModal();
+  const err = $("pickError"); err.hidden = !r.error; err.textContent = r.error || "";
+
+  const crumbs = $("pickCrumbs"); crumbs.innerHTML = "";
+  r.crumbs.forEach((c, i) => {
+    if (i) crumbs.appendChild(el("i", "", "/"));
+    const b = el("button", "", c.label); b.type = "button"; b.onclick = () => openPicker(c.path);
+    if (i === r.crumbs.length - 1) b.setAttribute("aria-current", "location");
+    crumbs.appendChild(b);
+  });
+
+  const places = $("pickPlaces"); places.innerHTML = ""; let lastKind = null;
+  const row = (label, target, kind) => {
+    const li = el("li"); const b = el("button"); b.type = "button"; b.title = target;
+    b.append(el("i", "ico" + (kind === "card" ? " card" : kind === "drive" ? " drive" : "")), el("span", "", label));
+    if (r.path === target) b.setAttribute("aria-current", "location");
+    b.onclick = () => openPicker(target); li.appendChild(b); places.appendChild(li);
   };
-  if (r.parent) add("↑ Up one level", r.parent);
-  for (const d of r.dirs) add(d, r.path.replace(/\/$/, "") + "/" + d);
-  if (!r.dirs.length) { const li = document.createElement("li"); li.className = "hint"; li.style.padding = "6px 14px";
-    li.textContent = r.error || "No subfolders here."; ul.appendChild(li); }
-  const sc = $("pickShort"); sc.innerHTML = "";
-  for (const s of (r.shortcuts || [])) { const b = document.createElement("button"); b.type = "button";
-    b.textContent = s.label; b.onclick = () => openPicker(s.path); sc.appendChild(b); sc.append(" "); }
+  for (const pl of r.places) {
+    const group = (pl.kind === "card" || pl.kind === "drive") ? "ext" : "local";
+    if (lastKind && group !== lastKind) places.appendChild(el("li", "sep"));
+    lastKind = group; row(pl.label, pl.path, pl.kind);
+  }
+  const recent = (state.config.recent_folders || []);
+  if (recent.length) {
+    places.appendChild(el("li", "sep"));
+    for (const f of recent) row(f.split("/").filter(Boolean).pop() || f, f, "folder");
+  }
+
+  const ul = $("pickList"); ul.innerHTML = "";
+  for (const d of r.dirs) {
+    const li = el("li"); const b = el("button"); b.type = "button";
+    b.append(el("i", "ico"), el("span", "", d));
+    b.onclick = () => openPicker(r.path.replace(/\/$/, "") + "/" + d); li.appendChild(b); ul.appendChild(li);
+  }
+  if (!r.dirs.length && !r.error) ul.appendChild(el("li", "msg", "No folders inside this one."));
+  const n = r.media_here;
+  say($("pickInfo"), n === null ? "" : n ? n.toLocaleString() + (n >= 5000 ? "+" : "") + " photos and videos directly in this folder"
+    : r.dirs.length ? "No photos here; its subfolders are included in the import" : "No photos or videos in this folder");
 }
 $("browseBtn").onclick = e => { e.preventDefault(); openPicker(folder || state.config.last_folder || ""); };
-$("pickCancel").onclick = e => { e.preventDefault(); $("picker").hidden = true; };
-$("pickUse").onclick = e => { e.preventDefault(); folder = pickAt; selected = "__folder__"; $("picker").hidden = true; syncSelection(); };
-
+$("pickCancel").onclick = () => $("picker").close();
+$("pickUse").onclick = () => { folder = pickAt; selected = "__folder__"; $("picker").close(); syncSelection(); };
+$("pickGo").onclick = () => openPicker($("pickInput").value.trim());
+$("pickForm").addEventListener("submit", e => { e.preventDefault(); openPicker($("pickInput").value.trim()); });
+function renderQuick() {
+  const box = $("quick"); box.innerHTML = "";
+  const line = (title, items) => {
+    if (!items.length) return;
+    const row = el("div", "row"); row.appendChild(el("span", "", title));
+    for (const it of items) { const b = el("button", "", it.label); b.type = "button"; b.title = it.path;
+      b.onclick = it.pick ? () => { folder = it.path; selected = "__folder__"; syncSelection(); } : () => openPicker(it.path);
+      row.appendChild(b); }
+    box.appendChild(row);
+  };
+  line("Drives", (state.drives || []).map(d => ({label: d.name, path: d.path})));
+  line("Recent", (state.config.recent_folders || []).map(f => ({label: f.split("/").filter(Boolean).pop() || f, path: f, pick: true})));
+}
 $("rescan").onclick = async () => {
-  setInfo($("scanInfo"), "Looking…");
-  state.cards = (await api("/api/cards")).cards; renderCards();
-  setInfo($("scanInfo"), state.cards.length ? state.cards.length + " card(s) found." : "No card found.");
+  say($("scanInfo"), "Looking…");
+  const found = await api("/api/cards"); state.cards = found.cards; state.drives = found.drives;
+  for (const k of Object.keys(scans)) delete scans[k];
+  renderCards(); renderQuick();
+  const c = state.cards.length, d = state.drives.length;
+  say($("scanInfo"), (c === 1 ? "1 card" : c + " cards") + " and " + (d === 1 ? "1 drive" : d + " drives") + " found.");
 };
-$("showKey").onclick = () => { const k = $("api_key"); const show = k.type === "password";
-  k.type = show ? "text" : "password"; $("showKey").textContent = show ? "Hide" : "Show"; };
 
-async function save() {
-  const r = await api("/api/config", readForm());
-  if (!r.ok) { setInfo($("saveInfo"), r.message, "bad"); return false; }
-  state.config = r.config; state.immich_go = r.immich_go; fillForm(r.config); envLine();
-  setInfo($("saveInfo"), "Saved.", "ok"); updatePreview(); return true;
-}
-$("save").onclick = save;
-$("test").onclick = async () => {
-  if (!(await save())) return;
-  setInfo($("saveInfo"), "Testing…");
-  const r = await api("/api/test", {}); setInfo($("saveInfo"), r.message, r.ok ? "ok" : "bad");
-};
-document.querySelector("section:nth-of-type(2)").addEventListener("input", () => {
-  dirty = true; setInfo($("saveInfo"), "Unsaved changes.", "warn"); });
-
-function envLine() {
-  const parts = [];
-  parts.push(state.immich_go ? "immich-go: " + state.immich_go : "immich-go not found — brew install immich-go");
-  $("envline").textContent = parts.join(" · ");
-  $("envline").className = "sub" + (state.immich_go ? "" : " bad");
-  $("cfgPath").textContent = "Settings file: " + state.config_file + " (contains your API key; readable by you only)" +
-    (state.imported_from ? " · first-run values were read from " + state.imported_from : "");
-}
-
-function setRunning(on) {
-  $("run").disabled = on; $("dry").disabled = on; $("stop").disabled = !on; $("eject").disabled = on;
+/* ---- running an import */
+function setRunning(on, started) {
+  running = on;
+  $("run").hidden = on; $("dry").hidden = on; $("stop").hidden = !on; $("eject").disabled = on;
+  $("meter").classList.toggle("on", on);
+  clearInterval(ticking); $("clock").textContent = "";
+  if (on && started) {
+    const tick = () => { $("clock").textContent = fmtTime(Date.now() / 1000 - started); };
+    tick(); ticking = setInterval(tick, 1000);
+  }
 }
 async function start(dry) {
   const src = currentSource();
-  if (!src) { setInfo($("runInfo"), "Choose a card or folder first.", "bad"); return; }
-  if (dirty && !(await save())) return;
-  const r = await api("/api/run", {source: src, dry_run: dry});
-  if (!r.ok) { setInfo($("runInfo"), r.message, "bad"); return; }
-  $("log").textContent = ""; logNext = 0; setRunning(true);
-  setInfo($("runInfo"), dry ? "Dry run in progress…" : "Importing…"); poll();
+  if (!src) { say($("runInfo"), "Choose a card or a folder first.", "bad"); return; }
+  if (dirty && !(await save())) { show("settings"); return; }
+  let r;
+  try { r = await api("/api/run", {source: src, dry_run: dry}); }
+  catch (e) { say($("runInfo"), "Could not start. Is the app still running?", "bad"); return; }
+  if (!r.ok) { say($("runInfo"), r.message, "bad"); return; }
+  if (selected === "__folder__") {
+    state.config.recent_folders = [src].concat((state.config.recent_folders || []).filter(f => f !== src)).slice(0, 6);
+    state.config.last_folder = src; renderQuick();
+  }
+  const log = $("log"); log.textContent = ""; log.classList.remove("idle"); logNext = 0;
+  setRunning(true, Date.now() / 1000);
+  say($("runInfo"), dry ? "Previewing. Nothing is being uploaded." : "Importing to Immich."); poll();
 }
 $("dry").onclick = () => start(true);
 $("run").onclick = () => start(false);
-$("stop").onclick = async () => { await api("/api/stop", {}); setInfo($("runInfo"), "Stopping…", "warn"); };
+$("stop").onclick = async () => { await api("/api/stop", {}); say($("runInfo"), "Stopping…", "warn"); };
 $("eject").onclick = async () => {
   const r = await api("/api/eject", {path: currentSource()});
-  setInfo($("runInfo"), r.message, r.ok ? "ok" : "bad");
+  say($("runInfo"), r.message, r.ok ? "good" : "bad");
   if (r.ok) $("rescan").click();
 };
-
 async function poll() {
   clearTimeout(polling);
   let j;
   try { j = await api("/api/log?since=" + logNext); }
-  catch (e) { setInfo($("runInfo"), "Lost contact with the app. Is it still running?", "bad"); setRunning(false); return; }
+  catch (e) { say($("runInfo"), "Lost contact with my_immich. Start it again from Applications.", "bad"); setRunning(false); return; }
   if (j.lines.length) {
-    const log = $("log"); const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    const log = $("log"); log.classList.remove("idle");
+    const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
     log.textContent += (log.textContent ? "\n" : "") + j.lines.join("\n");
     if (atEnd) log.scrollTop = log.scrollHeight;
   }
   logNext = j.next;
-  if (j.running) { setRunning(true); polling = setTimeout(poll, 1000); return; }
+  if (j.running) { if (!running) setRunning(true, j.started); polling = setTimeout(poll, 1000); return; }
   setRunning(false);
   if (j.returncode === null) return;
-  const what = j.dry_run ? "Dry run" : "Import";
-  if (j.stopped) setInfo($("runInfo"), what + " stopped. Run it again to pick up where it left off.", "warn");
-  else if (j.returncode === 0) setInfo($("runInfo"), what + " finished" + (j.dry_run ? " — nothing was uploaded." : "."), "ok");
-  else setInfo($("runInfo"), what + " failed (exit code " + j.returncode + "). See the log.", "bad");
+  const took = j.finished && j.started ? " in " + fmtTime(j.finished - j.started) : "";
+  if (j.stopped) say($("runInfo"), (j.dry_run ? "Preview" : "Import") + " stopped. Run it again to carry on where it left off.", "warn");
+  else if (j.returncode === 0) say($("runInfo"), j.dry_run ? "Preview finished" + took + ". Nothing was uploaded." : "Import finished" + took + ". Check Immich before formatting the card.", "good");
+  else say($("runInfo"), (j.dry_run ? "Preview" : "Import") + " failed. The last lines of the log say why.", "bad");
 }
 
 (async function init() {
   try { state = await api("/api/state"); }
-  catch (e) { $("envline").textContent = "Could not load. Restart the app and use the page it opens."; return; }
+  catch (e) { $("sourceLine").textContent = "Could not load. Quit my_immich and open it again."; return; }
   folder = state.config.last_folder || "";
-  fillForm(state.config); envLine(); renderCards();
+  fillForm(state.config); say($("saveInfo"), ""); health(); renderCards(); renderQuick();
+  const want = location.hash.slice(1);
+  show(want === "settings" || !(state.config.server && state.config.api_key) ? "settings" : "import");
+  if (state.config.server) checkServer(); else { $("srvDot").className = "dot bad"; $("srvText").textContent = "Immich is not set up yet. Open Settings."; }
   if (state.job.running || state.job.returncode !== null) { $("log").textContent = ""; logNext = 0; poll(); }
 })();
 </script>

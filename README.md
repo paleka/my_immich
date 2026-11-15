@@ -1,20 +1,33 @@
 # my_immich
 
-A small Mac app for getting photos from a camera SD card (or any folder) into
-a self-hosted [Immich](https://immich.app) server. It sits in the menu bar,
+A small Mac app for getting photos into a self-hosted
+[Immich](https://immich.app) server from a camera SD card, a USB drive, an
+external disk or any folder. It sits in the menu bar,
 opens a local page in your browser, and runs
 [immich-go](https://github.com/simulot/immich-go) for you with settings that
 stay put between imports.
 
+![The Import screen: a camera card selected on the left, the import log on the right](docs/import.png)
+
 - **Card aware.** Any mounted volume with a `DCIM` folder shows up as an SD
-  card, with its subfolders, file count and size. Any other folder can be
-  picked too.
+  card, with its subfolders, file count and size.
+- **Any other source.** A folder chooser lists your USB drives and external
+  disks next to Home, Pictures and recent folders, with a clickable path, a
+  box to type or paste a path, and a count of the photos in each folder.
 - **Editable settings.** Server, API key, RAW+JPEG handling, burst stacking,
   albums, import tag and more — saved to one file and reused every time.
 - **Safe to repeat.** immich-go skips files Immich already has, so importing
   the same card twice uploads nothing new.
 - **Dry run first.** Preview exactly what would be uploaded before sending
   anything.
+
+## Screenshots
+
+| Choosing a folder on an external drive | Settings, in dark mode |
+|---|---|
+| ![Folder chooser listing the folders on an external drive](docs/choose-folder.png) | ![Settings screen in dark mode](docs/settings.png) |
+
+The screenshots use demo data, not a real library or server.
 
 ## Requirements
 
@@ -55,9 +68,10 @@ Options: `--port 8765` (default) and `--no-browser`.
 2. **Settings** — enter the Immich server address and API key, press
    **Test connection**, then **Save settings**. On first run these are read
    from `~/scripts/sd-to-immich.sh` if that file exists.
-3. **Source** — insert a card (press **Rescan for cards** if it was inserted
-   after the page loaded) or choose **Other folder**.
-4. **Preview (dry run)** — check the log; nothing is uploaded.
+3. **Import → From** — pick the card, or press **Choose folder** for anything
+   else. Press **Look for cards and drives again** if you plugged something
+   in after the page loaded.
+4. **Preview first** — check the log; nothing is uploaded.
 5. **Import to Immich** — watch the log. **Stop** ends it early; running the
    import again continues where it left off.
 6. Check the photos in Immich before formatting the card.
@@ -65,6 +79,29 @@ Options: `--port 8765` (default) and `--no-browser`.
 The menu-bar item shows whether a card is inserted and how the last import
 ended, and sends a notification when a card appears or an import finishes.
 **Quit** asks first if an import is running, because quitting stops it.
+
+## Importing from USB drives and external disks
+
+Any folder works the same way as a card:
+
+1. Press **Choose folder**, or one of the **Drives** buttons under it to jump
+   straight to a plugged-in drive.
+2. Move around by clicking folders, the path segments at the top, or the
+   places on the left; or paste a path into the box and press Go.
+3. The line at the bottom says how many photos and videos sit directly in the
+   current folder. Subfolders are included in the import as well.
+4. Press **Use this folder**, then **Preview first**.
+
+Tips for big, old archives:
+
+- Turn on **Albums from folders** in Settings if the folder names are worth
+  keeping (for example `2019 Croatia`). Turn it off again for card imports.
+- Import one top-level folder at a time. A stopped or failed import can be
+  run again; files already in Immich are skipped.
+- The first time you open Desktop, Documents, Downloads or an external drive,
+  macOS may ask whether Python may access it. Allow it, or the folder shows
+  as unreadable.
+- Folders you imported from are remembered under **Recent**.
 
 ## Settings
 
@@ -114,7 +151,8 @@ add.
 | "immich-go not found" at the top of the page | `brew install immich-go`, or set its full path under More options. |
 | "Cannot reach …" on Test connection | You are off the home network/VPN, or the address or port is wrong. |
 | "API key was refused" | The key is wrong or lacks `user.read`; see the list above. |
-| Card not listed | It must be mounted and contain a `DCIM` folder. Press Rescan, or use Other folder. |
+| Card not listed | It must be mounted and contain a `DCIM` folder. Press "Look for cards and drives again", or use Choose folder. |
+| A folder shows "macOS did not allow reading this folder" | System Settings → Privacy & Security → Files and Folders: allow Python (my_immich) for that location. |
 | Page says it lost contact | The app was quit. Launch it again. |
 | Port 8765 is taken | The app tries the next 19 ports; the menu-bar **Open my_immich** item always goes to the right one. |
 
@@ -132,6 +170,7 @@ install.sh          builds ~/Applications/my_immich.app and its Python environme
 uninstall.sh        removes them
 requirements.txt    rumps (menu-bar icon only)
 tests/              unit tests: python3 -m unittest discover -s tests -v
+docs/               screenshots used in this README
 CLAUDE.md           notes for working on the code
 ```
 
@@ -145,9 +184,10 @@ and streams its output to the page with the API key masked.
 
 ## Known limits
 
-- The menu-bar icon, notifications, app bundle and card eject have not been
-  run on a Mac yet; the page, settings and import logic are covered by the
-  tests. Report what `~/Library/Logs/my_immich.log` says if something is off.
+- The page, settings, folder chooser and import logic are covered by the
+  tests. Launching the app has been confirmed on a Mac; notifications and
+  card eject have not been exercised yet. Report what
+  `~/Library/Logs/my_immich.log` says if something is off.
 - One import at a time.
 - The API key is passed to immich-go on its command line, so other processes
   running as your user can see it while an import runs.
