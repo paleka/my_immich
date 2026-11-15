@@ -37,8 +37,34 @@ CARD = Path(TMP) / "Volumes" / "EOS_DIGITAL"
 (CARD / "DCIM" / "100CANON" / ".hidden.jpg").write_bytes(b"x")
 
 FAKE_GO = Path(TMP) / "immich-go"
-FAKE_GO.write_text('#!/bin/bash\necho "args: $*"\necho "key=SECRET123"\n[[ "$*" == *--fail* ]] && exit 3\nexit 0\n')
+FAKE_GO.write_text('#!/bin/bash\necho "args: $*"\necho "key=SECRET123"\n'
+                   # the status line immich-go --no-ui rewrites in place with a carriage return
+                   'printf "\\rImmich read 50%%, Assets found: 2, Upload errors: 0, Uploaded 0  "\n'
+                   'echo; echo \'2026-01-01 10:00:00 INF uploaded successfully file="My Card:100CANON/IM5A0001.CR3"\'\n'
+                   'printf "\\rImmich read 100%%, Assets found: 2, Upload errors: 1, Uploaded 1 ."\n'
+                   'echo\n[[ "$*" == *--fail* ]] && exit 3\nexit 0\n')
 FAKE_GO.chmod(0o755)
+
+
+# A second stand-in that behaves like the real tool with a log file: per-file events go
+# to --log-file, only the status line goes to the screen. With REFUSE in its name it
+# rejects the flag, like a build that does not know it.
+LOG_GO = Path(TMP) / "immich-go-logfile"
+LOG_GO.write_text("""#!/bin/bash
+log=/dev/null
+for a in "$@"; do [[ "$a" == --log-file=* ]] && log="${a#--log-file=}"; done
+if [[ "$0" == *REFUSE* && "$log" != /dev/null ]]; then echo "Error: unknown flag: --log-file"; exit 1; fi
+echo '2026-01-01 10:00:00 INF discovered image file="DCIM:100CANON/IM5A0001.CR3"' >> "$log"
+echo '2026-01-01 10:00:00 INF discovered image file="DCIM:102WHALE/IM5A0366.CR3"' >> "$log"
+echo '2026-01-01 10:00:01 INF uploaded successfully file="DCIM:100CANON/IM5A0001.CR3"' >> "$log"
+echo '2026-01-01 10:00:01 INF tagged file="DCIM:100CANON/IM5A0001.CR3" tag=x' >> "$log"
+echo '2026-01-01 10:00:02 INF server has duplicate file="DCIM:102WHALE/IM5A0366.CR3"' >> "$log"
+printf "\\rImmich read 100%%, Assets found: 2, Upload errors: 0, Uploaded 1  \\n"
+""")
+LOG_GO.chmod(0o755)
+REFUSE_GO = Path(TMP) / "immich-go-REFUSE"
+REFUSE_GO.write_text(LOG_GO.read_text())
+REFUSE_GO.chmod(0o755)
 
 
 def cfg(**over):
@@ -124,7 +150,18 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(cards[0]["folders"], ["100CANON", "102WHALE"])
 
     def test_scan_counts_media_only(self):
-        self.assertEqual(app.scan_folder(str(CARD / "DCIM")), {"files": 2, "bytes": 3000})
+        found = app.scan_folder(str(CARD / "DCIM"))
+        self.assertEqual((found["files"], found["bytes"]), (2, 3000))
+        self.assertEqual((found["photos"], found["videos"], found["raw"]), (2, 0, 2))
+        self.assertLessEqual(found["oldest"], found["newest"])
+
+    def test_scan_samples_are_photos(self):
+        found = app.scan_folder(str(CARD / "DCIM"), want_samples=True)
+        self.assertEqual([os.path.basename(p) for p in found["samples"]], ["IM5A0001.CR3", "IM5A0366.CR3"])
+
+    def test_thumbnail_rules(self):
+        self.assertIsNone(app.make_thumb(str(CARD / "DCIM" / "100CANON" / "notes.txt")))   # not media
+        self.assertIsNone(app.make_thumb("/no/such/file.jpg"))
 
     def test_volume_of(self):
         self.assertTrue(app.volume_of(str(CARD / "DCIM" / "100CANON")).endswith("EOS_DIGITAL"))
@@ -177,6 +214,50 @@ class JobTests(unittest.TestCase):
         self.assertIn("--dry-run", text)
         self.assertNotIn("SECRET123", text)
 
+    def test_status_line_becomes_progress_not_log(self):
+        job, _ = self.run_job(cfg(), str(CARD / "DCIM"))
+        snap = job.snapshot(0)
+        self.assertEqual(snap["progress"], {"immich_read": 100, "found": 2, "errors": 1, "uploaded": 1})
+        status_lines = [line for line in snap["lines"] if "Assets found" in line]
+        self.assertEqual(len(status_lines), 1)                     # only the final one is kept
+        self.assertEqual(snap["current"], "100CANON/IM5A0001.CR3")  # quoted name with a space in the source
+
+    def test_source_is_counted_for_the_progress_panel(self):
+        job, _ = self.run_job(cfg(), str(CARD / "DCIM"))
+        for _ in range(100):
+            if job.snapshot(0)["totals"]:
+                break
+            time.sleep(0.02)
+        snap = job.snapshot(0)
+        self.assertEqual(snap["totals"]["files"], 2)
+        self.assertEqual(len(snap["samples"]), 2)
+
+    def test_events_from_the_log_file_are_counted(self):
+        job, error = self.run_job(cfg(immich_go_path=str(LOG_GO)), str(CARD / "DCIM"))
+        self.assertIsNone(error)
+        snap = job.snapshot(0)
+        self.assertEqual(snap["counters"], {"found_images": 2, "uploaded": 1, "tagged": 1, "on_server": 1})
+        self.assertEqual(snap["bytes_up"], 2000)                    # size of the one uploaded file
+        self.assertEqual([f["kind"] for f in snap["feed"]], ["uploaded", "on_server"])
+        self.assertTrue(any("uploaded successfully" in line for line in snap["lines"]))   # shown in the log
+        self.assertTrue(any("--log-file=" in line for line in snap["lines"][:1]))
+
+    def test_runs_again_without_log_file_when_refused(self):
+        job, _ = self.run_job(cfg(immich_go_path=str(REFUSE_GO)), str(CARD / "DCIM"))
+        snap = job.snapshot(0)
+        self.assertEqual(snap["returncode"], 0)
+        self.assertTrue(any("running again without it" in line for line in snap["lines"]))
+        self.assertEqual(snap["progress"]["uploaded"], 1)
+
+    def test_own_log_file_setting_is_respected(self):
+        job, _ = self.run_job(cfg(immich_go_path=str(LOG_GO), extra_args="--log-file=/dev/null"), str(CARD / "DCIM"))
+        commands = [line for line in job.snapshot(0)["lines"] if line.startswith("$ ")]
+        self.assertEqual(commands[0].count("--log-file"), 1)
+
+    def test_network_counters_are_readable_or_absent(self):
+        counters = app.net_counters()
+        self.assertTrue(counters is None or (len(counters) == 2 and all(c >= 0 for c in counters)))
+
     def test_failure_exit_code(self):
         job, _ = self.run_job(cfg(extra_args="--fail"), str(CARD / "DCIM"))
         self.assertEqual(job.snapshot(0)["returncode"], 3)
@@ -228,6 +309,14 @@ class ServerTests(unittest.TestCase):
         data = json.loads(body)
         self.assertEqual(data["cards"][0]["name"], "EOS_DIGITAL")
         self.assertEqual(data["config"]["server"], "http://immich.local:2283")
+
+    def test_thumbnail_needs_token(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.get("/api/thumb?path=/etc/hosts")
+        self.assertEqual(ctx.exception.code, 403)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.get("/api/thumb?t=%s&path=/etc/hosts" % app.TOKEN)   # right token, but not a photo
+        self.assertEqual(ctx.exception.code, 404)
 
     def test_hello_identifies_app(self):
         _, body = self.get("/api/hello")

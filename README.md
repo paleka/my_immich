@@ -7,7 +7,7 @@ opens a local page in your browser, and runs
 [immich-go](https://github.com/simulot/immich-go) for you with settings that
 stay put between imports.
 
-![The Import screen: a camera card selected on the left, the import log on the right](docs/import.png)
+![An import in progress: percentage, files done, time left, pace and a contact sheet of the photos](docs/progress.png)
 
 - **Card aware.** Any mounted volume with a `DCIM` folder shows up as an SD
   card, with its subfolders, file count and size.
@@ -20,12 +20,19 @@ stay put between imports.
   the same card twice uploads nothing new.
 - **Dry run first.** Preview exactly what would be uploaded before sending
   anything.
+- **Progress you can read.** Percentage, files done, time left, pace, and a
+  contact sheet of the photos that "develops" from amber to colour as the
+  import passes them.
 
 ## Screenshots
 
 | Choosing a folder on an external drive | Settings, in dark mode |
 |---|---|
 | ![Folder chooser listing the folders on an external drive](docs/choose-folder.png) | ![Settings screen in dark mode](docs/settings.png) |
+
+| A finished import | The Setup guide |
+|---|---|
+| ![A finished import: 100 percent, the contact sheet in full colour and a summary of what was left out](docs/import.png) | ![Setup page with each step ticked off](docs/setup.png) |
 
 The screenshots use demo data, not a real library or server.
 
@@ -63,22 +70,63 @@ Options: `--port 8765` (default) and `--no-browser`.
 
 ## Use
 
-1. Launch my_immich. An **MI** item appears in the menu bar and the page opens
-   at <http://127.0.0.1:8765>.
-2. **Settings** — enter the Immich server address and API key, press
-   **Test connection**, then **Save settings**. On first run these are read
-   from `~/scripts/sd-to-immich.sh` if that file exists.
+1. Launch my_immich. A card-shaped icon appears in the menu bar and the page
+   opens at <http://127.0.0.1:8765>.
+2. **Setup** — the page opens here until everything is ready. It walks through
+   installing immich-go, entering the server address, creating an API key and
+   testing the connection, ticking each step off as it is done.
+   (**Settings** holds the same fields plus the import options. On first run
+   the server and key are read from `~/scripts/sd-to-immich.sh` if it exists.)
 3. **Import → From** — pick the card, or press **Choose folder** for anything
    else. Press **Look for cards and drives again** if you plugged something
    in after the page loaded.
 4. **Preview first** — check the log; nothing is uploaded.
-5. **Import to Immich** — watch the log. **Stop** ends it early; running the
-   import again continues where it left off.
+5. **Import to Immich** — the panel shows how far along it is (see
+   [Progress](#progress)). **Stop** ends it early; running the import again
+   continues where it left off.
 6. Check the photos in Immich before formatting the card.
 
 The menu-bar item shows whether a card is inserted and how the last import
 ended, and sends a notification when a card appears or an import finishes.
 **Quit** asks first if an import is running, because quitting stops it.
+
+## Progress
+
+While an import or preview runs, the panel on the right shows:
+
+- **Phase and percentage.** First "Reading your Immich library", then
+  "Uploading" with the current file name. The browser tab title shows the
+  percentage too.
+- **Done, Time left, Pace, Elapsed.** Time left and pace are estimates from
+  the last minute of uploads.
+- **Upload speed chart.** Megabytes a second over the last four minutes, with
+  the current and peak values, measured from the sizes of the files as they
+  finish.
+- **Contact sheet.** Up to twelve photos spread evenly through the source.
+  Frames start dim and amber and turn to full colour as the import reaches
+  them. Thumbnails are made with macOS's `sips`, which reads camera RAW;
+  videos and formats it cannot read show the file name instead.
+- **Readouts.** Data sent so far; network traffic leaving this Mac (all apps,
+  on the interface that reaches the server); how fast the server answers and
+  its Immich version; immich-go's CPU and memory use; how many photos and
+  videos your Immich holds and how many this run added; server disk space
+  used and how much this run added. A readout is left out when its number is
+  not available, for example when the API key lacks the permission.
+- **Counters.** How many photos and videos immich-go found, uploaded, found
+  already in Immich, found duplicated on the source, set aside by your
+  settings, stacked, tagged, added to albums, or failed.
+- **Latest files.** The last six files and what happened to each.
+- **Result.** When it ends: finished, stopped or failed, and what was left
+  out and why.
+
+The full immich-go log is under "Show the full log", and opens by itself when
+a run fails.
+
+How it works: immich-go is asked to write its detailed log to a temporary
+file (`--log-file`), which my_immich follows for the per-file events and
+deletes afterwards. If your immich-go does not accept that flag, the import
+is started again without it and the panel falls back to the numbers from
+immich-go's one-line status.
 
 ## Importing from USB drives and external disks
 
@@ -147,8 +195,8 @@ add.
 
 | Problem | What to check |
 |---|---|
-| No **MI** icon after launching | Read `~/Library/Logs/my_immich.log`. Re-run `bash install.sh` if it mentions `rumps`. |
-| "immich-go not found" at the top of the page | `brew install immich-go`, or set its full path under More options. |
+| No menu-bar icon after launching | Read `~/Library/Logs/my_immich.log`. Re-run `bash install.sh` if it mentions `rumps`. |
+| Setup says immich-go was not found | `brew install immich-go`, or set its full path under More options. |
 | "Cannot reach …" on Test connection | You are off the home network/VPN, or the address or port is wrong. |
 | "API key was refused" | The key is wrong or lacks `user.read`; see the list above. |
 | Card not listed | It must be mounted and contain a `DCIM` folder. Press "Look for cards and drives again", or use Choose folder. |
@@ -166,7 +214,8 @@ add.
 
 ```
 my_immich.py        the whole app: local web server, page, import runner, menu-bar icon
-install.sh          builds ~/Applications/my_immich.app and its Python environment
+install.sh          builds ~/Applications/my_immich.app (with its icon) and its Python environment
+assets/             menu-bar icon and app icon, as SVG sources and rendered PNGs
 uninstall.sh        removes them
 requirements.txt    rumps (menu-bar icon only)
 tests/              unit tests: python3 -m unittest discover -s tests -v

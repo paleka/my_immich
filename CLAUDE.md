@@ -31,7 +31,8 @@ Top to bottom:
    child process and buffers its log), `eject_for`.
 5. HTTP: `Handler` with the JSON API under `/api/…`.
 6. `PAGE`: the whole web page (HTML, CSS, JS) as one raw string. It is an app
-   shell: sidebar navigation, an Import view and a Settings view, and a
+   shell: sidebar navigation, Import, Settings and Setup views (Setup is the
+   first-run checklist, driven by `renderSetup()`), and a
    `<dialog>` folder chooser. Colours and radii are CSS variables at the top;
    amber is the single accent and the SD-card shape is the one decorative motif.
    System fonts only, so it works offline. Keep light and dark in step.
@@ -60,7 +61,53 @@ Top to bottom:
   options in `MY_IMMICH_*` environment variables. Do not add file paths to that argv.
 - Card detection means "a directory under the volumes root that contains
   `DCIM`"; the import source for a card is its `DCIM` folder.
+- **Keep the README screenshots current.** When the page's look changes, retake
+  the affected images in `docs/` (`progress.png`, `import.png`, `choose-folder.png`,
+  `settings.png`, `setup.png`) in the same change. Use demo data only: a made-up
+  server name, a placeholder user and invented folder names, never a real library,
+  address or API key. They are 1240 px wide at 2x.
 - Do not commit or push unless asked.
+
+## Progress display
+
+Everything on the progress panel comes from one `/api/log` snapshot, rendered by
+`showProgress(j)` and `drawGeek(j, t)` in the page. Where the numbers come from:
+
+- **Status line.** With `--no-ui`, immich-go rewrites one line every 500 ms using a
+  bare carriage return: `Immich read N%, Assets found: N, Upload errors: N, Uploaded N`.
+  `Job._take` parses it with `PROGRESS_RE` into `job.progress` and keeps it out of the
+  log (the last one is logged once). Source:
+  <https://github.com/simulot/immich-go/blob/main/app/upload/noui.go>.
+- **Per-file events.** `Job._run` adds `--log-file=<temp file>` and `_follow_log`
+  tails it. Each log line's message is one of the strings in `EVENTS` (from
+  `internal/fileevent/fileevents.go` in immich-go) with a `file=` attribute;
+  `_event` turns them into `counters`, the `feed`, and `bytes_up` (the size of
+  each uploaded file, looked up under the source folder). If immich-go answers
+  "unknown flag" for `--log-file`, the run restarts once without it. If the user
+  put their own `--log-file` in Extra arguments, ours is not added.
+- **Per-second samples.** `_sample` records `points` (files, bytes, interface
+  bytes sent) for the chart, plus `process_stats` (`ps`/`pgrep`), `net_counters`
+  (`netstat -ibn` on macOS, `/proc/net/dev` on Linux) and `server_stats` (Immich's
+  `/api/server/ping`, `/api/assets/statistics`, `/api/server/storage`,
+  `/api/server/version`). Every one of these is optional and is simply left off the
+  panel when it cannot be read.
+- `Job._count_source` scans the source in a thread for totals and the contact
+  sheet sample. `make_thumb` shells out to `sips` on macOS; `/api/thumb` takes the
+  token as a query parameter because `<img>` cannot send headers.
+
+If immich-go changes its status line or event wording, the panel degrades (waiting
+bar, no counters) rather than breaking; update `PROGRESS_RE`/`EVENTS` and the tests
+named `test_status_line_...` and `test_events_from_the_log_file_...`.
+
+## Icons
+
+- `assets/menubar.png` (44×44, black on transparent) is the menu-bar icon, loaded
+  by `run_tray` as a template image so macOS recolours it for light and dark menu
+  bars. If the file is missing the tray falls back to the text "MI".
+- `assets/icon.png` (1024×1024) is the app icon; `install.sh` turns it into
+  `AppIcon.icns` with `sips` and `iconutil`.
+- Both are rendered from the `.svg` files beside them. Re-render the PNGs after
+  editing an SVG. The browser-tab icon is an inline SVG in `PAGE`.
 
 ## Not yet verified on macOS
 
